@@ -1,5 +1,3 @@
-package com.prime.utils
-
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import scala.io.Source
 import java.nio.charset.CodingErrorAction
