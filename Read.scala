@@ -1,5 +1,3 @@
-package com.prime.utils
-
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.SparkSession
@@ -173,7 +171,7 @@ object implicitHelperClass {
      val spark = SparkSession
 			.builder()
 			.appName("Spark Hive Example")
-			//.config("hive.metastore.uris", "jdbc:hive2://lxlcmn002d.primetherapeutics.com:10000")
+			//.config("hive.metastore.uris", "jdbc:hive2")
 			.config("hive.exec.dynamic.partition", "true")
 			.config("hive.exec.dynamic.partition.mode", "nonstrict")
 			.enableHiveSupport()
