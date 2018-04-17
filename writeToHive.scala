@@ -1,5 +1,3 @@
-package com.prime.utils
-
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql._
@@ -14,8 +12,6 @@ import org.apache.spark.sql.types.{ DataType, StructType }
  * ### 							a) 	loadHiveTable - To append data into an existing Hive Table
  * ###							b)  overwriteHiveTable - Rewrite existing partitioned Hive table as per the given specifications
  * ###							C)  overwriteHivePartition - Overwrite existing partitioned Hive table
- * ### Code Version: 0.01
- * ### Change Log: <Date:08-03-2018>
  */
 
 case class HiveTableNotFoundException(msg: String) extends Exception
@@ -159,33 +155,6 @@ object WriteToHive {
       return false
     }
   }
-  
-  /*
-   def main(args: Array[String]) {
-    val spark = SparkSession
-			.builder()
-			.appName("Spark Hive Example")
-			//.config("hive.metastore.uris", "jdbc:hive2://lxlcmn002d.primetherapeutics.com:10000")
-			.config("hive.exec.dynamic.partition", "true")
-			.config("hive.exec.dynamic.partition.mode", "nonstrict")
-			.enableHiveSupport()
-			.getOrCreate();
-
-    val hiveWritableDF = spark.read.
-    format("com.databricks.spark.csv").
-    option("delimiter","|").
-    option("header","true").
-    load("/tmp/edhuploadsbx/HMS_Individual_Profiles.tab");
-	//hiveWritableDF.show()
-	var db = "edhuploadsbx"
-	var tableName = "T_HMS_INDV_PRFL"
-	loadHiveTable(hiveWritableDF,db,tableName)
     
-     
-  }
-  * 
-  */
-
-     
  }
  
