@@ -1,0 +1,117 @@
+package com.conformed
+
+import java.time.LocalDateTime
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.lit
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import com.utils.connections.ExecuteMySqlStmt
+import com.utils.connections.MySqlConnection
+import com.utils.loaders.WriteToHive
+import com.audit.AuditSqlUtils
+import com.dq.ErrorExceptions
+import org.apache.spark.sql._
+
+def performCDC(srcDF:DataFrame,targetDF: DataFrame,auditFields:String,busKey: List[String], stgTableFields: List[String], targetTableFields: List[String]):DataFrame={
+   //Fetching CDC Attributes of stage table data frame
+    var busKeyList=busKey
+    val stgAuditFieldsList=instance.stgAuditFields.split(",").toList
+    var stgCdcAttributes=stgTableFields diff busKeyList diff stgAuditFieldsList
+		var allKeys= busKeyList:::stgCdcAttributes
+		
+		//Fetching CDC Attributes of target table data frame
+		val targetAuditFieldsList=instance.targetAuditFields.split(",").toList
+		var targetCdcAttributes=targetTableFields diff busKeyList diff targetAuditFieldsList diff List(instance.surrogateKeyColName,"rec_eff_tms")
+		
+    //Renaming CDC Attributes of target data frame to remove ambiguity
+    var renamedTargetCdcAttributes=List[String]()
+		for(element <- targetCdcAttributes){
+		  renamedTargetCdcAttributes=renamedTargetCdcAttributes ++ List(element+"_target")
+		}
+    
+    var renamedTargetAuditFields=List[String]()
+    for(element <- targetAuditFieldsList){
+		  renamedTargetAuditFields=renamedTargetAuditFields ++ List(element+"_target")
+		}
+    var targetAllKeys=busKeyList ::: renamedTargetCdcAttributes 
+    val newTargetColNames=List(instance.surrogateKeyColName,"rec_eff_tms"):::busKeyList::: renamedTargetCdcAttributes:::renamedTargetAuditFields
+		var renamedTargetDF=targetDF.toDF(newTargetColNames:_*)
+		
+		
+    
+		//Filtering out delete field from CDC Attributes if delete flag is Y
+    if(instance.deleteFlag.equals("Y")){
+      stgCdcAttributes=stgCdcAttributes diff List(instance.deleteField)
+      renamedTargetCdcAttributes=renamedTargetCdcAttributes diff List(s"${instance.deleteField}_target")
+    }
+    
+    //Mapping and comparing the stage and target side dataframes
+		val equalsExprs=stgCdcAttributes.zip(renamedTargetCdcAttributes).map{case(c1,c2)=> not(col(s"srcDF.${c1}") <=> col(s"targetDF.${c2}")).cast("int").alias(s"${c1}_ne")}
+    //val equalsExprs=cdcAttributes.map(c=> not(col(s"srcDF.$c") <=> col(s"targetDF.${c}_target")).cast("int").alias(s"${c}_ne"))
+		val diff=equalsExprs.foldLeft(lit(0))(_+_).alias("diff")
+		
+		var deleteData : DataFrame=null
+		var otherRecords: DataFrame=null
+		var consolidatedData : DataFrame=null
+		targetAllKeys=List(instance.surrogateKeyColName):::targetAllKeys
+		//Filtering out delete records for the NUCC
+		if(instance.srcSysName.equals("NUCC")){
+		  var activeTargetDF=renamedTargetDF.filter(col("rec_stat_cd")==="A")
+		  var nuccJoinDF=activeTargetDF.join(srcDF,Seq(busKeyList:_*),"left")
+		  deleteData=nuccJoinDF.filter(col(stgCdcAttributes(0)).isNull).selectExpr(newTargetColNames:_*)
+		  //renamedTargetDF=nuccJoinDF.filter(col(stgCdcAttributes(0)).isNotNull)
+		  renamedTargetDF=renamedTargetDF.except(deleteData)
+		  deleteData=deleteData.selectExpr(targetAllKeys:_*).withColumn("REC_STAT_CD", lit("I"))
+		}
+		
+		
+		//Left join on the two dataframes
+		var joinDF=srcDF.as("srcDF").join(renamedTargetDF.as("targetDF"), Seq(busKeyList:_*), "left")
+		joinDF=joinDF.withColumn("difference", diff)  
+		
+		
+		//Filtering out insert records
+		var insertData=joinDF.filter(col(instance.surrogateKeyColName).isNull).selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("A"))
+		allKeys= List(instance.surrogateKeyColName):::allKeys
+		insertData=insertData.withColumn(instance.surrogateKeyColName, lit(-1)).selectExpr(allKeys:_*)
+		
+		//Filtering out delete records for CMS
+		if(instance.srcSysName.equals("CMS")){
+		  val condition=col("NPI_DACT_DT").isNotNull && col("NPI_DACT_DT")>=col("LAST_UPD_DT") && col("NPI_DACT_DT")>=col("NPI_RCTVTN_DT")
+		  deleteData=joinDF.filter(condition).selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("I"))
+		}
+		
+		//Filtering out delete records for other cases
+		if(instance.deleteFlag.equals("Y")){
+		  if(instance.deleteFieldCondition.toLowerCase().equals("equals")){
+		     deleteData=joinDF.filter(col(instance.surrogateKeyColName).isNotNull && col(instance.deleteField)===s"${instance.deleteFieldValue}").selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("I"))
+		     otherRecords=joinDF.filter(col(instance.surrogateKeyColName).isNotNull && col(instance.deleteField) =!= s"${instance.deleteFieldValue}")
+		  }
+		  else if(instance.deleteFieldCondition.toLowerCase().equals("not equals")){
+		     deleteData=joinDF.filter(col(instance.surrogateKeyColName).isNotNull && col(instance.deleteField) =!= s"${instance.deleteFieldValue}").selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("I"))
+		     otherRecords=joinDF.filter(col(instance.surrogateKeyColName).isNotNull && col(instance.deleteField)===s"${instance.deleteFieldValue}")
+		  }
+		 
+		}
+		  
+		//Filtering out update and no change records
+		var updateData=otherRecords.filter(col(instance.surrogateKeyColName).isNotNull && col("difference")>0).selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("A"))
+		var noChangeData=otherRecords.filter(col(instance.surrogateKeyColName).isNotNull && col("difference")===0).selectExpr(allKeys:_*).withColumn("REC_STAT_CD", lit("A"))
+		
+		//Adding column CDC_FLAG to show insert, update, delete and no change records
+		insertData=insertData.withColumn("CDC_FLAG", lit("I"))
+		deleteData=deleteData.withColumn("CDC_FLAG", lit("D"))
+		updateData=updateData.withColumn("CDC_FLAG", lit("U"))
+		noChangeData=noChangeData.withColumn("CDC_FLAG", lit("N"))
+		
+		//Combining all records together and returning from function
+		if(deleteData == null){
+		  consolidatedData=insertData.union(updateData.union(noChangeData))
+		}
+		else{
+		  consolidatedData=insertData.union(deleteData.union(updateData.union(noChangeData)))
+		}
+		return consolidatedData
+	}
