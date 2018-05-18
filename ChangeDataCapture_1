@@ -14,7 +14,7 @@ import com.audit.AuditSqlUtils
 import com.dq.ErrorExceptions
 import org.apache.spark.sql._
 
-def performCDC(srcDF:DataFrame,targetDF: DataFrame,auditFields:String,busKey: List[String], stgTableFields: List[String], targetTableFields: List[String]):DataFrame={
+def performCDCEqualExpression(srcDF:DataFrame,targetDF: DataFrame,auditFields:String,busKey: List[String], stgTableFields: List[String], targetTableFields: List[String]):DataFrame={
    //Fetching CDC Attributes of stage table data frame
     var busKeyList=busKey
     val stgAuditFieldsList=instance.stgAuditFields.split(",").toList
@@ -115,3 +115,93 @@ def performCDC(srcDF:DataFrame,targetDF: DataFrame,auditFields:String,busKey: Li
 		}
 		return consolidatedData
 	}
+
+def performCDCHash(srcDF:DataFrame,targetDF: DataFrame,busKey: List[String], stgCdcAttributesIdx: String, targetCdcAttributesIdx: String,spark:SparkSession):DataFrame={
+   import spark.implicits._
+    //Fetching CDC Attributes of stage table data frame
+    var busKeyList=busKey
+    var allKeys= srcDF.columns.toList
+		
+		//Fetching CDC Attributes of target table data frame
+		//val targetAuditFieldsList=instance.targetAuditFields.split(",").toList
+		
+		var targetColNames= targetDF.columns.toList
+		
+		for(element <- targetColNames){
+		  if(!busKeyList.contains(element) && !element.equals(instance.surrogateKeyColName)){
+		    var idx=targetColNames.indexOf(element)
+		    targetColNames=targetColNames.updated(idx, element+"_target")
+		  }
+		}
+		
+    var renamedTargetDF=targetDF.toDF(targetColNames:_*)
+    
+    var stgCdcAttributesIdxArr=stgCdcAttributesIdx.split(",").map(_.toInt)
+    var stgCdcAttributes=(stgCdcAttributesIdxArr map srcDF.columns).toList
+    
+		var targetCdcAttributesIdxArr=targetCdcAttributesIdx.split(",").map(_.toInt)
+    var targetCdcAttributes=(targetCdcAttributesIdxArr map renamedTargetDF.columns).toList
+    
+   val concat_row = udf((r: Row) => {
+        val s = r.mkString("|")
+        s
+      })
+      
+     val hashedStgDF=srcDF.withColumn("Hash_Source", md5(concat_row(struct(stgCdcAttributes.head, stgCdcAttributes.tail: _*))))
+     val hashedTargetDF=renamedTargetDF.withColumn("Hash_Target", md5(concat_row(struct(targetCdcAttributes.head, targetCdcAttributes.tail: _*))))
+    
+    var deleteData : DataFrame=null
+		var otherRecords: DataFrame=null
+		var consolidatedData : DataFrame=null
+		
+		
+		
+		
+		//Left join on the two dataframes
+		var joinDF=hashedStgDF.as("srcDF").join(hashedTargetDF.as("targetDF"), Seq(busKeyList:_*), "left")
+		 
+		
+		
+		//Filtering out insert records
+		var insertData=joinDF.filter(col(instance.surrogateKeyColName).isNull).selectExpr(allKeys:_*)
+		allKeys= List(instance.surrogateKeyColName):::allKeys
+		insertData=insertData.withColumn(instance.surrogateKeyColName, lit(-1)).selectExpr(allKeys:_*)
+		otherRecords=joinDF.filter(col(instance.surrogateKeyColName).isNotNull)
+		
+		//Filtering out delete records 
+		if(instance.deleteFlag.equals("Y")){
+		  if(instance.deleteMode.toLowerCase().equals("source")){
+		    deleteData=otherRecords.filter(col(instance.deleteField)===s"${instance.deleteFieldValue}").selectExpr(allKeys:_*)
+		    otherRecords=otherRecords.filter(col(instance.deleteField) =!= s"${instance.deleteFieldValue}")
+		  }
+		  else if(instance.deleteMode.toLowerCase().equals("target")){
+		    val activeTargetDF=hashedTargetDF.filter(col(instance.statusCol.trim())==="A")
+		    val srcBusKeyList=hashedStgDF.select(busKeyList(0)).map(_.getString(0)).collect.toList
+		    deleteData=activeTargetDF.filter(!col(busKeyList(0)).isin(srcBusKeyList:_*))
+		    
+		    //deleteData=joinDF.filter(col(stgCdcAttributes(0)).isNull).selectExpr(targetAllKeys:_*)
+		    //otherRecords=joinDF.filter(col(stgCdcAttributes(0)).isNotNull)
+		  }
+		 
+		}
+		  
+		//Filtering out update and no change records
+		var updateData=otherRecords.filter( col("Hash_Source")=!=col("Hash_Target")).selectExpr(allKeys:_*)
+		var noChangeData=otherRecords.filter( col("Hash_Source")===col("Hash_Target")).selectExpr(allKeys:_*)
+		
+		//Adding column CDC_FLAG to show insert, update, delete and no change records
+		insertData=insertData.withColumn("CDC_FLAG", lit("I"))
+		updateData=updateData.withColumn("CDC_FLAG", lit("U"))
+		noChangeData=noChangeData.withColumn("CDC_FLAG", lit("N"))
+		
+		//Combining all records together and returning from function
+		if(deleteData == null){
+		  consolidatedData=insertData.union(updateData.union(noChangeData))
+		}
+		else{
+		  deleteData=deleteData.withColumn("CDC_FLAG", lit("D"))
+		  consolidatedData=insertData.union(deleteData.union(updateData.union(noChangeData)))
+		}
+		return consolidatedData
+	}
+
